@@ -15,33 +15,51 @@
 # DRA Kubelet Plugin Re-Roll Hook (issue #980).
 #
 # Ships as part of the bundler-synthesized "gpu-operator-post" chart.
-# Helm post-install,post-upgrade hook that waits for gpu-operator's
-# k8s-driver-manager to finish migrating drivers on every managed GPU
-# node, then re-rolls the nvidia-dra-driver-gpu kubelet plugin
-# DaemonSet. Mirrors the kubectl wait + rollout-restart block in
+# Waits for gpu-operator's k8s-driver-manager to finish migrating
+# drivers on every managed GPU node, then re-rolls the
+# nvidia-dra-driver-gpu kubelet plugin DaemonSet. Mirrors the
+# kubectl wait + rollout-restart block in
 # pkg/bundler/deployer/helm/templates/deploy.sh.tmpl so the same
 # protection applies to every deployer (Helm, helmfile, Flux, Argo CD),
 # not just the default Helm deployer that runs ./deploy.sh.
+#
+# Why a regular Job, not a Helm post-install/post-upgrade hook:
+#
+# The local-helm bundler (pkg/bundler/deployer/localformat/local_helm.go)
+# unconditionally strips helm.sh/hook* annotations from rendered
+# manifests because Argo CD's syncPolicy.automated would otherwise
+# treat the resource as a PostSync hook that never fires. Re-firing
+# on chart upgrades is preserved instead by keying the Job name on
+# the synthesized chart's version (which inherits the parent
+# gpu-operator's componentRef version at
+# pkg/bundler/deployer/localformat/writer.go:121) so every chart
+# bump produces a new Job manifest that every deployer applies.
+# helm.sh/resource-policy: keep prevents Helm's three-way merge from
+# pruning the prior Job mid-rollout; ttlSecondsAfterFinished lets
+# Kubernetes self-clean the prior succeeded Job.
 #
 # Host-managed-driver overlays (GKE COS, OKE, Kind, Talos) run
 # gpu-operator with driver.enabled=false; nvidia-driver-daemonset is
 # never created, so the script detects its absence and skips the
 # migration wait. If the DRA kubelet plugin DaemonSet is also absent
-# (e.g. fresh install before nvidia-dra-driver-gpu's chart has applied)
+# (fresh install before nvidia-dra-driver-gpu's chart has applied)
 # the script exits 0 — the rollout-restart is only meaningful when
 # both pieces already exist (the upgrade path).
+#
+# Image: pinned by digest (manifest list / multi-arch index) per the
+# repo's image-pinning standard. alpine/k8s ships kubectl + busybox
+# sh in a small layer; the script targets POSIX sh, not bash.
 
-{{- $namespace := .Release.Namespace }}
-{{- $draNamespace := "nvidia-dra-driver" }}
 {{- $saName := "aicr-dra-rollout-hook" }}
-{{- $jobName := "aicr-dra-rollout-hook" }}
+{{- $versionSlug := .Chart.Version | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
+{{- $jobName := printf "aicr-dra-rollout-hook-%s" $versionSlug | trunc 63 | trimSuffix "-" }}
 {{- $chartLabel := printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ $saName }}
-  namespace: {{ $namespace }}
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/component: dra-rollout-hook
@@ -56,15 +74,22 @@ metadata:
     app.kubernetes.io/component: dra-rollout-hook
     helm.sh/chart: {{ $chartLabel }}
 rules:
-  # Detect host-managed-driver overlays via nvidia-driver-daemonset
-  # presence (cross-namespace, since the operator can run in
-  # "gpu-operator" or e.g. "privileged-gpu-operator" on Talos).
+  # Discover the nvidia-dra-driver-gpu kubelet-plugin DaemonSet by
+  # label across all namespaces (the os-talos mixin and ad-hoc recipe
+  # overrides can place it outside the default nvidia-dra-driver
+  # namespace), then patch it to trigger rollout-restart and watch
+  # for rollout-status. kubectl rollout status watches the DaemonSet
+  # resource itself, not just Pods, so the watch verb is required.
   - apiGroups: ["apps"]
     resources: ["daemonsets"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "watch", "patch"]
   # Wait for per-node gpu-driver-upgrade-state=upgrade-done label.
   - apiGroups: [""]
     resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # rollout status reads pod state to confirm the new generation is up.
+  - apiGroups: [""]
+    resources: ["pods"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -78,61 +103,27 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: {{ $saName }}
-    namespace: {{ $namespace }}
+    namespace: {{ .Release.Namespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ $saName }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {{ $saName }}
-  namespace: {{ $draNamespace }}
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/component: dra-rollout-hook
-    helm.sh/chart: {{ $chartLabel }}
-rules:
-  # rollout restart = patch the DaemonSet's pod-template-hash trigger.
-  - apiGroups: ["apps"]
-    resources: ["daemonsets"]
-    verbs: ["get", "list", "patch"]
-  # rollout status reads pods to confirm the new generation is up.
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ $saName }}
-  namespace: {{ $draNamespace }}
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/component: dra-rollout-hook
-    helm.sh/chart: {{ $chartLabel }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ $saName }}
-    namespace: {{ $namespace }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
   name: {{ $saName }}
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: {{ $jobName }}
-  namespace: {{ $namespace }}
+  namespace: {{ .Release.Namespace }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # Prevent Helm's three-way merge from pruning prior-version Jobs
+    # mid-rollout. ttlSecondsAfterFinished lets Kubernetes garbage-
+    # collect succeeded Jobs after 10m so the namespace doesn't
+    # accumulate one per past chart bump.
+    "helm.sh/resource-policy": keep
   labels:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/component: dra-rollout-hook
+    aicr.nvidia.com/gpu-operator-chart-version: "{{ .Chart.Version }}"
     helm.sh/chart: {{ $chartLabel }}
 spec:
   ttlSecondsAfterFinished: 600
@@ -141,30 +132,30 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/component: dra-rollout-hook
+        aicr.nvidia.com/gpu-operator-chart-version: "{{ .Chart.Version }}"
     spec:
       serviceAccountName: {{ $saName }}
       restartPolicy: OnFailure
       containers:
         - name: rollout
-          image: docker.io/bitnami/kubectl:1.34
+          image: docker.io/alpine/k8s:1.34.8@sha256:4d352ba7479706876a62566c4a8eaaf44d8182d39ee456dbd884830df5e493be
           imagePullPolicy: IfNotPresent
           command:
-            - /bin/bash
+            - /bin/sh
             - -c
             - |
-              set -euo pipefail
-              DRA_NS={{ $draNamespace | quote }}
+              set -eu
 
               echo "Locating nvidia-driver-daemonset to determine deployment mode..."
               DRIVER_DS_NS=$(kubectl get daemonset -A \
                 -o jsonpath='{.items[?(@.metadata.name=="nvidia-driver-daemonset")].metadata.namespace}' \
                 2>/dev/null | awk '{print $1}')
 
-              if [[ -z "${DRIVER_DS_NS}" ]]; then
+              if [ -z "${DRIVER_DS_NS}" ]; then
                 echo "  gpu-operator nvidia-driver-daemonset not present (host-managed driver); skipping migration wait"
               else
                 MANAGED_NODES=$(kubectl get nodes -l nvidia.com/gpu.deploy.driver=true -o name 2>/dev/null | wc -l | tr -d ' ')
-                if [[ "${MANAGED_NODES}" -gt 0 ]]; then
+                if [ "${MANAGED_NODES}" -gt 0 ]; then
                   echo "  Waiting for gpu-operator driver migration on ${MANAGED_NODES} managed GPU node(s) to reach upgrade-done (ns=${DRIVER_DS_NS})..."
                   if ! kubectl wait --for=jsonpath='{.metadata.labels.nvidia\.com/gpu-driver-upgrade-state}=upgrade-done' \
                        nodes -l nvidia.com/gpu.deploy.driver=true --timeout=15m; then
@@ -175,20 +166,40 @@ spec:
                 fi
               fi
 
-              DRA_DS=$(kubectl get daemonset -n "${DRA_NS}" -o name 2>/dev/null | awk '/kubelet-plugin/{print; exit}' || true)
-              if [[ -z "${DRA_DS}" ]]; then
-                echo "  DRA kubelet plugin daemonset not present in ${DRA_NS}; nothing to restart"
+              # Locate the DRA kubelet-plugin DaemonSet by label across
+              # all namespaces so os-talos / privileged-* overlays that
+              # move nvidia-dra-driver-gpu out of its default namespace
+              # are handled without hardcoding a value.
+              DRA_LOC=$(kubectl get daemonset -A \
+                -l app.kubernetes.io/name=nvidia-dra-driver-gpu \
+                -o jsonpath='{range .items[?(@.metadata.labels.app\.kubernetes\.io/component!="controller")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+                2>/dev/null | grep -E '(kubelet-plugin|dra-driver)' | head -n 1 || true)
+
+              if [ -z "${DRA_LOC}" ]; then
+                # Fallback: take the first nvidia-dra-driver-gpu DS regardless
+                # of label/name shape — covers chart variants that don't set a
+                # component=controller label on the controller Deployment.
+                DRA_LOC=$(kubectl get daemonset -A \
+                  -l app.kubernetes.io/name=nvidia-dra-driver-gpu \
+                  -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+                  2>/dev/null | head -n 1 || true)
+              fi
+
+              if [ -z "${DRA_LOC}" ]; then
+                echo "  DRA kubelet plugin daemonset not present; nothing to restart"
                 exit 0
               fi
 
-              echo "  Restarting DRA kubelet plugin (${DRA_DS##*/}) to clear stale NVML state..."
-              if ! kubectl rollout restart "${DRA_DS}" -n "${DRA_NS}"; then
+              DRA_NS="${DRA_LOC%%/*}"
+              DRA_DS_NAME="${DRA_LOC#*/}"
+              echo "  Restarting DRA kubelet plugin (${DRA_NS}/${DRA_DS_NAME}) to clear stale NVML state..."
+              if ! kubectl rollout restart "daemonset/${DRA_DS_NAME}" -n "${DRA_NS}"; then
                 echo "  ERROR: failed to restart DRA kubelet plugin daemonset"
                 exit 1
               fi
 
               echo "  Waiting for DRA kubelet plugin rollout to complete..."
-              if ! kubectl rollout status "${DRA_DS}" -n "${DRA_NS}" --timeout=5m; then
+              if ! kubectl rollout status "daemonset/${DRA_DS_NAME}" -n "${DRA_NS}" --timeout=5m; then
                 echo "  WARNING: DRA kubelet plugin rollout did not complete within 5m (restart has been triggered)"
               fi
 
