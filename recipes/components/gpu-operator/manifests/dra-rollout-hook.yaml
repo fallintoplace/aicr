@@ -63,13 +63,17 @@
 # repo's image-pinning standard. alpine/k8s ships kubectl + busybox
 # sh in a small layer; the script targets POSIX sh, not bash.
 
+# $versionLabel: K8s-label-safe version. Semver build metadata (e.g.
+# 26.3.1+build.1) is legal in Chart.yaml but '+' is rejected by
+# label-value validation. Replace with '-' so the label survives any
+# future change in the resolved gpu-operator chart pin. The
+# dot/build-tag separators ('.') stay; they are valid in label values.
+# Plain YAML '#' comments are required here — a Go-template
+# `{{- /* … */}}` block renders fine through Helm but breaks the
+# TestComponentManifestImagesAre* tests in recipes/, which decode the
+# raw manifest as YAML before rendering.
 {{- $saName := "aicr-dra-rollout-hook" }}
 {{- $parentVersion := index .Values "gpu-operator" "_aicrParentChartVersion" | toString }}
-{{- /* $versionLabel: K8s-label-safe version. Semver build metadata
-       (e.g. 26.3.1+build.1) is legal in Chart.yaml but '+' is rejected
-       by label-value validation. Replace with '-' so the label survives
-       any future change in the resolved gpu-operator chart pin. The
-       dot/build-tag separators ('.') are still allowed in label values. */}}
 {{- $versionLabel := $parentVersion | replace "+" "-" | trunc 63 | trimSuffix "-" }}
 {{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
 {{- $jobName := printf "aicr-dra-rollout-hook-%s" $versionSlug | trunc 63 | trimSuffix "-" }}
