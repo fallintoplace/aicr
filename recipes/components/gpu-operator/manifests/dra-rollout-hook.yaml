@@ -30,11 +30,18 @@
 # manifests because Argo CD's syncPolicy.automated would otherwise
 # treat the resource as a PostSync hook that never fires. Re-firing
 # on chart upgrades is preserved instead by keying the Job name on
-# .Chart.Version, which the bundler substitutes at generation time
-# (via pkg/manifest.Render with the parent gpu-operator componentRef's
-# version) for every deployer — localformat (helm / helmfile /
-# argocd-helm) and flux alike. Every gpu-operator chart bump produces
-# a uniquely-named Job manifest that every deployer applies.
+# the parent gpu-operator chart version, which the bundler injects
+# into the synthesized chart's values map at
+# `gpu-operator._aicrParentChartVersion` (see
+# DefaultBundler.injectDRAParentChartVersionValue in
+# pkg/bundler/bundler.go). The values-map path is used in preference
+# to .Chart.Version for two reasons: (1) the synthesized chart's
+# Chart.yaml hardcodes version 0.1.0 so .Chart.Version would never
+# change across gpu-operator bumps, defeating the re-fire mechanism;
+# and (2) under flux-oci, source-controller suffixes .Chart.Version
+# with "+<artifact-sha>" — the '+' is rejected by K8s label
+# validation. Every gpu-operator chart bump now produces a uniquely-
+# named Job manifest that every deployer applies.
 # helm.sh/resource-policy: keep prevents Helm's three-way merge from
 # pruning the prior Job mid-rollout. ttlSecondsAfterFinished is
 # intentionally NOT set: the Job is part of GitOps desired state,
@@ -57,9 +64,10 @@
 # sh in a small layer; the script targets POSIX sh, not bash.
 
 {{- $saName := "aicr-dra-rollout-hook" }}
-{{- $versionSlug := .Chart.Version | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
+{{- $parentVersion := index .Values "gpu-operator" "_aicrParentChartVersion" | toString }}
+{{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
 {{- $jobName := printf "aicr-dra-rollout-hook-%s" $versionSlug | trunc 63 | trimSuffix "-" }}
-{{- $chartLabel := printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- $chartLabel := printf "%s-%s" .Chart.Name $parentVersion | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -134,7 +142,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/component: dra-rollout-hook
-    aicr.nvidia.com/gpu-operator-chart-version: "{{ .Chart.Version }}"
+    aicr.nvidia.com/gpu-operator-chart-version: "{{ $parentVersion }}"
     helm.sh/chart: {{ $chartLabel }}
 spec:
   backoffLimit: 2
@@ -142,7 +150,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/component: dra-rollout-hook
-        aicr.nvidia.com/gpu-operator-chart-version: "{{ .Chart.Version }}"
+        aicr.nvidia.com/gpu-operator-chart-version: "{{ $parentVersion }}"
     spec:
       serviceAccountName: {{ $saName }}
       restartPolicy: OnFailure

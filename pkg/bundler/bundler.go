@@ -284,6 +284,17 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 			"failed to extract component values", err)
 	}
 
+	// Bundler-derived values that flow into manifest templates via the
+	// normal Helm install-time render path (NOT pre-rendered at bundle
+	// time, which would defeat downstream dynamic-values overrides).
+	// Applied AFTER extractComponentValues so a user --set cannot
+	// silently override the synthetic key. See issue #980 — the DRA
+	// rollout-hook needs the parent gpu-operator chart version to key
+	// its Job name without relying on .Chart.Version, which is the
+	// synthesized chart's hardcoded 0.1.0 (and is suffixed with
+	// +<artifact-sha> under flux-oci, breaking K8s label validation).
+	b.injectDRAParentChartVersionValue(componentValues, recipeResult)
+
 	if warningErr := b.warnMissingStorageClassForPVCs(ctx, recipeResult, componentValues); warningErr != nil {
 		return nil, warningErr
 	}
@@ -1502,4 +1513,86 @@ func renderGKECriticalPriorityQuota(namespace string, pods int) ([]byte, error) 
 		},
 	}
 	return serializer.MarshalYAMLDeterministic(quota)
+}
+
+// draParentChartVersionValueKey is the values-map key the bundler
+// writes into the gpu-operator componentValues so the manifest
+// template in recipes/components/gpu-operator/manifests/dra-rollout-hook.yaml
+// can read the resolved gpu-operator chart version at Helm install
+// time. The leading underscore signals "bundler-internal — do not
+// surface in --set documentation"; values.schema.json (if it ever
+// ships) should reject this key as unknown.
+const draParentChartVersionValueKey = "_aicrParentChartVersion"
+
+// injectDRAParentChartVersionValue writes the resolved gpu-operator
+// chart version into componentValues["gpu-operator"] under the key
+// _aicrParentChartVersion. The synthesized gpu-operator-post chart
+// inherits gpu-operator's values, so the DRA rollout-hook manifest
+// (issue #980) can read the parent chart version via
+// `{{ index .Values "gpu-operator" "_aicrParentChartVersion" }}`
+// at Helm install time.
+//
+// Why a values injection and not .Chart.Version:
+//
+// The synthesized -post chart's Chart.yaml hardcodes version: 0.1.0
+// (see pkg/bundler/deployer/localformat/templates/chart.yaml.tmpl
+// and flux/templates/chart.yaml.tmpl). Under flux-oci, source-
+// controller additionally suffixes that with "+<artifact-sha>" when
+// serving the ExternalArtifact — the '+' character is invalid in
+// K8s label values and the K8s API server rejects any Job carrying
+// the resulting string. Pulling the parent's version through the
+// values map sidesteps both the constant-0.1.0 problem (which would
+// have meant a constant Job name that never re-fires on upgrade) and
+// the flux-oci '+' problem.
+//
+// Trigger gating: BOTH gpu-operator and nvidia-dra-driver-gpu must
+// be enabled in the filtered recipe; otherwise the manifest doesn't
+// ship (gpu-operator-post is only synthesized when gpu-operator has
+// post-manifest content, and the rollout hook is only meaningful
+// when DRA is also installed). Recipes that disable either component
+// leave componentValues untouched.
+//
+// Injection point: called from DefaultBundler.Make AFTER
+// extractComponentValues (so user --set overrides have already been
+// applied and a typo'd user override of this internal key cannot
+// silently win) and BEFORE buildDeployer (so every deployer —
+// localformat / flux / argocd-helm — receives the same final map).
+// Mutates componentValues in place.
+func (b *DefaultBundler) injectDRAParentChartVersionValue(
+	componentValues map[string]map[string]any,
+	recipeResult *recipe.RecipeResult,
+) {
+
+	if componentValues == nil || recipeResult == nil {
+		return
+	}
+
+	const (
+		gpuOpName = "gpu-operator"
+		draName   = "nvidia-dra-driver-gpu"
+	)
+
+	var gpuOpVersion string
+	var draEnabled bool
+	for _, ref := range recipeResult.ComponentRefs {
+		switch ref.Name {
+		case gpuOpName:
+			gpuOpVersion = ref.Version
+		case draName:
+			draEnabled = true
+		}
+	}
+	if gpuOpVersion == "" || !draEnabled {
+		return
+	}
+
+	gpuOpValues := componentValues[gpuOpName]
+	if gpuOpValues == nil {
+		gpuOpValues = make(map[string]any)
+		componentValues[gpuOpName] = gpuOpValues
+	}
+	// Normalize the same way deployers normalize chart version pins so
+	// the rendered Job name doesn't carry a leading 'v' that earlier
+	// substitution chains would have stripped.
+	gpuOpValues[draParentChartVersionValueKey] = deployer.NormalizeVersionWithDefault(gpuOpVersion)
 }

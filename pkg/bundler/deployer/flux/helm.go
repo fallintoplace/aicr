@@ -26,7 +26,6 @@ import (
 	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
 	"github.com/NVIDIA/aicr/pkg/component"
 	"github.com/NVIDIA/aicr/pkg/errors"
-	"github.com/NVIDIA/aicr/pkg/manifest"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 )
@@ -231,25 +230,20 @@ func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, char
 	sort.Strings(manifestNames)
 
 	for _, name := range manifestNames {
-		// Pre-render the manifest content so .Chart.Version, .Chart.Name,
-		// .Release.Namespace, and .Values[<component>] resolve to the
-		// parent component's values at bundle generation. Other deployers
-		// (localformat / argocd-helm) already do this; flux previously
-		// wrote raw bytes and let Helm substitute at install time, which
-		// surfaced as a flux-oci-only failure when source-controller
-		// appended `+<artifact-sha>` to .Chart.Version and the resulting
-		// label values were rejected by the K8s API server. See #1034.
-		rendered, renderErr := manifest.Render(manifests[name], manifest.RenderInput{
-			ComponentName: compName,
-			Namespace:     namespace,
-			ChartName:     dirName,
-			ChartVersion:  normalizedVersion,
-			Values:        g.ComponentValues[compName],
-		})
-		if renderErr != nil {
-			return false, nil, errors.PropagateOrWrap(renderErr, errors.ErrCodeInternal,
-				fmt.Sprintf("failed to render manifest %s for %s", name, compName))
-		}
+		// Write the manifest content raw so dynamic `.Values.*`
+		// references the user marked via DynamicValues survive into the
+		// rendered chart and Helm can substitute them at install time
+		// from the static `spec.values` + dynamic ConfigMap merge.
+		// Bundler-time substitution would bake the static default into
+		// the template body and silently make the ConfigMap edits inert
+		// — see TestGenerate_WithDynamicValues_ManifestComponent and
+		// docs/user/cli-reference.md's dynamic-values section.
+		//
+		// Values that need to be visible to the manifest template at
+		// install time (e.g., the parent component's chart version for
+		// the #980 DRA rollout-hook Job name) flow in via the values
+		// map — see DefaultBundler.injectDRAParentChartVersionValue.
+		content := manifests[name]
 		safeName := filepath.Clean(name)
 		filePath, joinErr := deployer.SafeJoin(templatesDir, safeName)
 		if joinErr != nil {
@@ -259,12 +253,12 @@ func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, char
 			return false, nil, errors.Wrap(errors.ErrCodeInternal,
 				fmt.Sprintf("failed to create manifest subdirectory for %s/%s", compName, safeName), err)
 		}
-		if err := os.WriteFile(filePath, rendered, 0600); err != nil {
+		if err := os.WriteFile(filePath, content, 0600); err != nil {
 			return false, nil, errors.Wrap(errors.ErrCodeInternal,
 				fmt.Sprintf("failed to write template %s for %s", safeName, compName), err)
 		}
 		output.Files = append(output.Files, filePath)
-		output.TotalSize += int64(len(rendered))
+		output.TotalSize += int64(len(content))
 	}
 
 	// Write Chart.yaml using the same normalized parent version so
