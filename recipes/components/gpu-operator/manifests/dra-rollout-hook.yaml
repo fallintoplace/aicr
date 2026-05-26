@@ -74,13 +74,19 @@
 # raw manifest as YAML before rendering.
 {{- $saName := "aicr-dra-rollout-hook" }}
 {{- $parentVersion := index .Values "gpu-operator" "_aicrParentChartVersion" | toString }}
-# Trim trailing '.', '_', '-' after the 63-char cap so the label value
-# always ends alphanumeric (K8s label-value validation rejects a
-# non-alphanumeric trailing character). A long SemVer pre-release
-# can put any of the three at exactly the truncation boundary, so we
-# strip each variant. Chained twice to handle the pathological case
-# of two consecutive separators landing at the cut point.
-{{- $versionLabel := $parentVersion | replace "+" "-" | trunc 63 | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" }}
+# Trim trailing '.', '_', '-' after the cap so the label value always
+# ends alphanumeric (K8s label-value validation rejects a
+# non-alphanumeric trailing character). A long SemVer pre-release can
+# put any of the three at exactly the truncation boundary, so we
+# strip each variant. Truncate at 60 (3 chars below the 63 cap) to
+# leave headroom for a run of separators to be absorbed, and chain
+# the suffix-strip 5 times — more than enough to handle mixed
+# `.-_` runs at the boundary that one pass would miss. pkg/manifest's
+# helmFuncMap doesn't register a regex helper, so a chain of
+# `trimSuffix` is the only suffix-strip primitive available across
+# both the bundler-time render path (limited funcMap) and the Helm
+# install-time path.
+{{- $versionLabel := $parentVersion | replace "+" "-" | trunc 60 | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" }}
 # $hookRev: pod-spec revision counter. Job .spec.template is immutable
 # (Kubernetes rejects updates to any field under it with
 # "Forbidden: field is immutable"), so changing the image digest,
@@ -103,7 +109,7 @@
 # assembled name stays as a defense-in-depth cap.
 {{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 35 | trimSuffix "-" }}
 {{- $jobName := printf "aicr-dra-rollout-hook-%s-r%s" $versionSlug $hookRev | trunc 63 | trimSuffix "-" }}
-{{- $chartLabel := printf "%s-%s" .Chart.Name $parentVersion | replace "+" "_" | trunc 63 | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" }}
+{{- $chartLabel := printf "%s-%s" .Chart.Name $parentVersion | replace "+" "_" | trunc 60 | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" | trimSuffix "." | trimSuffix "_" | trimSuffix "-" }}
 ---
 apiVersion: v1
 kind: ServiceAccount
