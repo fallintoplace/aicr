@@ -116,9 +116,14 @@ metadata:
   namespace: {{ .Release.Namespace }}
   annotations:
     # Prevent Helm's three-way merge from pruning prior-version Jobs
-    # mid-rollout. ttlSecondsAfterFinished lets Kubernetes garbage-
-    # collect succeeded Jobs after 10m so the namespace doesn't
-    # accumulate one per past chart bump.
+    # mid-rollout. No ttlSecondsAfterFinished: Argo CD self-heal and
+    # Helm re-apply both treat a chart-version-keyed Job as desired
+    # state; a Kubernetes TTL delete would make the resource missing
+    # against the GitOps render and trigger an immediate recreate
+    # on the next reconcile, re-running the rollout-restart on every
+    # cycle. Old-version Jobs persist as Succeeded records and can
+    # be garbage-collected manually or by a follow-up cleanup
+    # mechanism if they become operationally noisy.
     "helm.sh/resource-policy": keep
   labels:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
@@ -126,7 +131,6 @@ metadata:
     aicr.nvidia.com/gpu-operator-chart-version: "{{ .Chart.Version }}"
     helm.sh/chart: {{ $chartLabel }}
 spec:
-  ttlSecondsAfterFinished: 600
   backoffLimit: 2
   template:
     metadata:
