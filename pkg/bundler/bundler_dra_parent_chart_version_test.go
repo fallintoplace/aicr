@@ -59,12 +59,17 @@ func TestInjectDRAParentChartVersionValue_PositiveCase(t *testing.T) {
 	}
 }
 
-// TestInjectDRAParentChartVersionValue_DRAComponentDisabled pins the
-// gating: when nvidia-dra-driver-gpu is absent (or filtered out via
-// --set), the synthetic value must not be written. The
-// gpu-operator-post manifest is only emitted when its parent has
-// post-manifest content, so injecting a value used only by the
-// rollout-hook would be dead weight on every other recipe.
+// TestInjectDRAParentChartVersionValue_DRAComponentDisabled documents
+// the looser gating from the second Codex review on PR #1030: the
+// rollout-hook manifest is wired into gpu-operator's manifestFiles in
+// base.yaml and ships whenever gpu-operator is enabled, regardless of
+// whether nvidia-dra-driver-gpu is also enabled. If the injection
+// gated on DRA-enabled, a recipe with --set
+// nvidia-dra-driver-gpu:enabled=false would emit the hook with
+// `<nil>` placeholders for the parent version and produce an invalid
+// DNS-1123 Job name. Inject unconditionally when gpu-operator is
+// present; the hook script's runtime "no DRA DaemonSet → exit 0"
+// branch keeps the Job a no-op when DRA is in fact absent.
 func TestInjectDRAParentChartVersionValue_DRAComponentDisabled(t *testing.T) {
 	b, err := New()
 	if err != nil {
@@ -82,9 +87,15 @@ func TestInjectDRAParentChartVersionValue_DRAComponentDisabled(t *testing.T) {
 
 	b.injectDRAParentChartVersionValue(componentValues, rr)
 
-	if _, present := componentValues["gpu-operator"][draParentChartVersionValueKey]; present {
-		t.Errorf("expected no %s key when DRA component is disabled, got %v",
-			draParentChartVersionValueKey, componentValues["gpu-operator"])
+	got, ok := componentValues["gpu-operator"][draParentChartVersionValueKey].(string)
+	if !ok {
+		t.Fatalf("expected the parent version to be injected even when DRA is disabled, got %T (%v)",
+			componentValues["gpu-operator"][draParentChartVersionValueKey],
+			componentValues["gpu-operator"])
+	}
+	if got != "26.4.0" {
+		t.Errorf("gpu-operator[%s] = %q, want %q",
+			draParentChartVersionValueKey, got, "26.4.0")
 	}
 }
 

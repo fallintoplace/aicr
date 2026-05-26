@@ -1545,12 +1545,17 @@ const draParentChartVersionValueKey = "_aicrParentChartVersion"
 // have meant a constant Job name that never re-fires on upgrade) and
 // the flux-oci '+' problem.
 //
-// Trigger gating: BOTH gpu-operator and nvidia-dra-driver-gpu must
-// be enabled in the filtered recipe; otherwise the manifest doesn't
-// ship (gpu-operator-post is only synthesized when gpu-operator has
-// post-manifest content, and the rollout hook is only meaningful
-// when DRA is also installed). Recipes that disable either component
-// leave componentValues untouched.
+// Trigger gating: gpu-operator must be enabled in the filtered
+// recipe. The hook manifest is wired into base.yaml's gpu-operator
+// componentRef's manifestFiles, so it ships whenever gpu-operator
+// ships — independent of whether nvidia-dra-driver-gpu is also
+// enabled. Without this looser gate, --set
+// nvidia-dra-driver-gpu:enabled=false produces an emitted hook with
+// un-substituted `<nil>` placeholders that K8s rejects as an invalid
+// DNS-1123 Job name. (When DRA is in fact disabled, the hook
+// script's "no DRA DaemonSet → exit 0" branch keeps the Job a no-op
+// at runtime, so over-injecting the value is harmless.) Recipes that
+// disable gpu-operator entirely leave componentValues untouched.
 //
 // Injection point: called from DefaultBundler.Make AFTER
 // extractComponentValues (so user --set overrides have already been
@@ -1567,22 +1572,16 @@ func (b *DefaultBundler) injectDRAParentChartVersionValue(
 		return
 	}
 
-	const (
-		gpuOpName = "gpu-operator"
-		draName   = "nvidia-dra-driver-gpu"
-	)
+	const gpuOpName = "gpu-operator"
 
 	var gpuOpVersion string
-	var draEnabled bool
 	for _, ref := range recipeResult.ComponentRefs {
-		switch ref.Name {
-		case gpuOpName:
+		if ref.Name == gpuOpName {
 			gpuOpVersion = ref.Version
-		case draName:
-			draEnabled = true
+			break
 		}
 	}
-	if gpuOpVersion == "" || !draEnabled {
+	if gpuOpVersion == "" {
 		return
 	}
 
