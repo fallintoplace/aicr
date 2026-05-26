@@ -65,6 +65,12 @@
 
 {{- $saName := "aicr-dra-rollout-hook" }}
 {{- $parentVersion := index .Values "gpu-operator" "_aicrParentChartVersion" | toString }}
+{{- /* $versionLabel: K8s-label-safe version. Semver build metadata
+       (e.g. 26.3.1+build.1) is legal in Chart.yaml but '+' is rejected
+       by label-value validation. Replace with '-' so the label survives
+       any future change in the resolved gpu-operator chart pin. The
+       dot/build-tag separators ('.') are still allowed in label values. */}}
+{{- $versionLabel := $parentVersion | replace "+" "-" | trunc 63 | trimSuffix "-" }}
 {{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
 {{- $jobName := printf "aicr-dra-rollout-hook-%s" $versionSlug | trunc 63 | trimSuffix "-" }}
 {{- $chartLabel := printf "%s-%s" .Chart.Name $parentVersion | replace "+" "_" | trunc 63 | trimSuffix "-" }}
@@ -142,7 +148,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/component: dra-rollout-hook
-    aicr.nvidia.com/gpu-operator-chart-version: "{{ $parentVersion }}"
+    aicr.nvidia.com/gpu-operator-chart-version: "{{ $versionLabel }}"
     helm.sh/chart: {{ $chartLabel }}
 spec:
   backoffLimit: 2
@@ -150,7 +156,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/component: dra-rollout-hook
-        aicr.nvidia.com/gpu-operator-chart-version: "{{ $parentVersion }}"
+        aicr.nvidia.com/gpu-operator-chart-version: "{{ $versionLabel }}"
     spec:
       serviceAccountName: {{ $saName }}
       restartPolicy: OnFailure
@@ -176,6 +182,34 @@ spec:
             - |
               set -eu
 
+              # Check DRA presence FIRST. The rollout-restart only makes
+              # sense if the DRA kubelet plugin is actually deployed; for
+              # DRA-disabled recipes (or any recipe where the DRA chart
+              # hasn't installed yet) we exit early and skip the
+              # potentially-15-minute driver-migration wait below. Locating
+              # by label `app.kubernetes.io/name=nvidia-dra-driver-gpu`
+              # across all namespaces handles os-talos / privileged-*
+              # overlays that move the DS out of its default namespace.
+              DRA_LOC=$(kubectl get daemonset -A \
+                -l app.kubernetes.io/name=nvidia-dra-driver-gpu \
+                -o jsonpath='{range .items[?(@.metadata.labels.app\.kubernetes\.io/component!="controller")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+                2>/dev/null | grep -E '(kubelet-plugin|dra-driver)' | head -n 1 || true)
+
+              if [ -z "${DRA_LOC}" ]; then
+                # Fallback: take the first nvidia-dra-driver-gpu DS regardless
+                # of label/name shape — covers chart variants that don't set a
+                # component=controller label on the controller Deployment.
+                DRA_LOC=$(kubectl get daemonset -A \
+                  -l app.kubernetes.io/name=nvidia-dra-driver-gpu \
+                  -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+                  2>/dev/null | head -n 1 || true)
+              fi
+
+              if [ -z "${DRA_LOC}" ]; then
+                echo "  DRA kubelet plugin daemonset not present; nothing to restart, exiting"
+                exit 0
+              fi
+
               echo "Locating nvidia-driver-daemonset to determine deployment mode..."
               DRIVER_DS_NS=$(kubectl get daemonset -A \
                 -o jsonpath='{.items[?(@.metadata.name=="nvidia-driver-daemonset")].metadata.namespace}' \
@@ -194,30 +228,6 @@ spec:
                 else
                   echo "  No nodes labeled nvidia.com/gpu.deploy.driver=true yet; skipping migration wait"
                 fi
-              fi
-
-              # Locate the DRA kubelet-plugin DaemonSet by label across
-              # all namespaces so os-talos / privileged-* overlays that
-              # move nvidia-dra-driver-gpu out of its default namespace
-              # are handled without hardcoding a value.
-              DRA_LOC=$(kubectl get daemonset -A \
-                -l app.kubernetes.io/name=nvidia-dra-driver-gpu \
-                -o jsonpath='{range .items[?(@.metadata.labels.app\.kubernetes\.io/component!="controller")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
-                2>/dev/null | grep -E '(kubelet-plugin|dra-driver)' | head -n 1 || true)
-
-              if [ -z "${DRA_LOC}" ]; then
-                # Fallback: take the first nvidia-dra-driver-gpu DS regardless
-                # of label/name shape — covers chart variants that don't set a
-                # component=controller label on the controller Deployment.
-                DRA_LOC=$(kubectl get daemonset -A \
-                  -l app.kubernetes.io/name=nvidia-dra-driver-gpu \
-                  -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
-                  2>/dev/null | head -n 1 || true)
-              fi
-
-              if [ -z "${DRA_LOC}" ]; then
-                echo "  DRA kubelet plugin daemonset not present; nothing to restart"
-                exit 0
               fi
 
               DRA_NS="${DRA_LOC%%/*}"
