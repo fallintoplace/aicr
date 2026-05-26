@@ -35,8 +35,13 @@
 # pkg/bundler/deployer/localformat/writer.go:121) so every chart
 # bump produces a new Job manifest that every deployer applies.
 # helm.sh/resource-policy: keep prevents Helm's three-way merge from
-# pruning the prior Job mid-rollout; ttlSecondsAfterFinished lets
-# Kubernetes self-clean the prior succeeded Job.
+# pruning the prior Job mid-rollout. ttlSecondsAfterFinished is
+# intentionally NOT set: the Job is part of GitOps desired state,
+# so a Kubernetes TTL delete would make the resource missing relative
+# to the rendered manifest and trigger an immediate recreate (plus
+# re-running rollout-restart) on the next Argo CD self-heal or Helm
+# re-apply cycle. Old-version Jobs persist as Succeeded records and
+# can be garbage-collected by label if they become operationally noisy.
 #
 # Host-managed-driver overlays (GKE COS, OKE, Kind, Talos) run
 # gpu-operator with driver.enabled=false; nvidia-driver-daemonset is
