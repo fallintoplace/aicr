@@ -30,10 +30,11 @@
 # manifests because Argo CD's syncPolicy.automated would otherwise
 # treat the resource as a PostSync hook that never fires. Re-firing
 # on chart upgrades is preserved instead by keying the Job name on
-# the synthesized chart's version (which inherits the parent
-# gpu-operator's componentRef version at
-# pkg/bundler/deployer/localformat/writer.go:121) so every chart
-# bump produces a new Job manifest that every deployer applies.
+# .Chart.Version, which the bundler substitutes at generation time
+# (via pkg/manifest.Render with the parent gpu-operator componentRef's
+# version) for every deployer — localformat (helm / helmfile /
+# argocd-helm) and flux alike. Every gpu-operator chart bump produces
+# a uniquely-named Job manifest that every deployer applies.
 # helm.sh/resource-policy: keep prevents Helm's three-way merge from
 # pruning the prior Job mid-rollout. ttlSecondsAfterFinished is
 # intentionally NOT set: the Job is part of GitOps desired state,

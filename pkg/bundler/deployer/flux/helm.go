@@ -26,6 +26,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/bundler/deployer/localformat"
 	"github.com/NVIDIA/aicr/pkg/component"
 	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/manifest"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 )
@@ -198,7 +199,7 @@ type ChartData struct {
 // it emits an ArtifactGenerator + ExternalArtifact pair and uses spec.chartRef.
 // Returns (wroteConfigMap, extraResourcePaths, error). extraResourcePaths
 // contains the ArtifactGenerator file path when in OCI mode, nil otherwise.
-func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, compDir string,
+func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, chartVersion, compDir string,
 	manifests map[string][]byte, gitSources map[string]*GitRepoSourceData,
 	dependsOn []DependsOnRef, output *deployer.Output) (bool, []string, error) {
 
@@ -212,6 +213,16 @@ func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, comp
 			fmt.Sprintf("failed to create templates directory for %s", compName), err)
 	}
 
+	// Resolve the chart version exactly once and reuse it for both the
+	// Chart.yaml metadata and the manifest.Render pass below. Empty
+	// component versions (manifest-only refs) fall back to "0.1.0" so
+	// the synthesized chart still has a valid semver. See issue #1034
+	// for the underlying defect: leaving chart.yaml.tmpl hardcoded to
+	// 0.1.0 produced a constant .Chart.Version that broke chart-version
+	// keyed Job names downstream; threading the parent component's
+	// version through fixes it at the source.
+	normalizedVersion := deployer.NormalizeVersionWithDefault(chartVersion)
+
 	// Write manifest files into templates/ in sorted order for determinism.
 	manifestNames := make([]string, 0, len(manifests))
 	for name := range manifests {
@@ -220,7 +231,25 @@ func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, comp
 	sort.Strings(manifestNames)
 
 	for _, name := range manifestNames {
-		content := manifests[name]
+		// Pre-render the manifest content so .Chart.Version, .Chart.Name,
+		// .Release.Namespace, and .Values[<component>] resolve to the
+		// parent component's values at bundle generation. Other deployers
+		// (localformat / argocd-helm) already do this; flux previously
+		// wrote raw bytes and let Helm substitute at install time, which
+		// surfaced as a flux-oci-only failure when source-controller
+		// appended `+<artifact-sha>` to .Chart.Version and the resulting
+		// label values were rejected by the K8s API server. See #1034.
+		rendered, renderErr := manifest.Render(manifests[name], manifest.RenderInput{
+			ComponentName: compName,
+			Namespace:     namespace,
+			ChartName:     dirName,
+			ChartVersion:  normalizedVersion,
+			Values:        g.ComponentValues[compName],
+		})
+		if renderErr != nil {
+			return false, nil, errors.PropagateOrWrap(renderErr, errors.ErrCodeInternal,
+				fmt.Sprintf("failed to render manifest %s for %s", name, compName))
+		}
 		safeName := filepath.Clean(name)
 		filePath, joinErr := deployer.SafeJoin(templatesDir, safeName)
 		if joinErr != nil {
@@ -230,16 +259,19 @@ func (g *Generator) generateManifestHelmChart(compName, dirName, namespace, comp
 			return false, nil, errors.Wrap(errors.ErrCodeInternal,
 				fmt.Sprintf("failed to create manifest subdirectory for %s/%s", compName, safeName), err)
 		}
-		if err := os.WriteFile(filePath, content, 0600); err != nil {
+		if err := os.WriteFile(filePath, rendered, 0600); err != nil {
 			return false, nil, errors.Wrap(errors.ErrCodeInternal,
 				fmt.Sprintf("failed to write template %s for %s", safeName, compName), err)
 		}
 		output.Files = append(output.Files, filePath)
-		output.TotalSize += int64(len(content))
+		output.TotalSize += int64(len(rendered))
 	}
 
-	// Write Chart.yaml.
-	if err := writeTemplate(output, chartTemplate, ChartData{Name: dirName, Version: "0.1.0"},
+	// Write Chart.yaml using the same normalized parent version so
+	// future readers of the synthesized chart (operators, attestations,
+	// any tooling that reads Chart.yaml directly) see the real chart
+	// identity, not a placeholder.
+	if err := writeTemplate(output, chartTemplate, ChartData{Name: dirName, Version: normalizedVersion},
 		compDir, fileChart,
 		fmt.Sprintf("failed to write %s for %s", fileChart, compName)); err != nil {
 		return false, nil, err
