@@ -76,7 +76,20 @@
 {{- $parentVersion := index .Values "gpu-operator" "_aicrParentChartVersion" | toString }}
 {{- $versionLabel := $parentVersion | replace "+" "-" | trunc 63 | trimSuffix "-" }}
 {{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
-{{- $jobName := printf "aicr-dra-rollout-hook-%s" $versionSlug | trunc 63 | trimSuffix "-" }}
+# $hookRev: pod-spec revision counter. Job .spec.template is immutable
+# (Kubernetes rejects updates to any field under it with
+# "Forbidden: field is immutable"), so changing the image digest,
+# shell script body, tolerations, resources, securityContext, etc.
+# of an existing aicr-dra-rollout-hook-<version> Job will fail to
+# apply on an upgrade where the gpu-operator chart pin is unchanged.
+# Bump $hookRev (1 → 2 → 3 → …) in lockstep with any material edit
+# to the Job spec below. The Job name carries this value so a bump
+# produces a fresh resource the deployer can create cleanly; prior
+# Jobs persist (helm.sh/resource-policy: keep) and can be GC'd by
+# label app.kubernetes.io/component=dra-rollout-hook if the
+# namespace accumulates noise.
+{{- $hookRev := "1" }}
+{{- $jobName := printf "aicr-dra-rollout-hook-%s-r%s" $versionSlug $hookRev | trunc 63 | trimSuffix "-" }}
 {{- $chartLabel := printf "%s-%s" .Chart.Name $parentVersion | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 ---
 apiVersion: v1
