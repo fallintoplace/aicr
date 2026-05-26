@@ -154,6 +154,18 @@ spec:
     spec:
       serviceAccountName: {{ $saName }}
       restartPolicy: OnFailure
+      # Tolerate every taint so the Job lands on whichever node the
+      # scheduler picks first. The Job is short-lived (a few kubectl
+      # calls plus an optional 15m wait for driver-migration) and only
+      # talks to the kube-apiserver — it does NOT exercise the GPU, so
+      # landing on a GPU-tainted node is harmless and a system node
+      # works equally well. Without this, CI clusters with KWOK nodes
+      # tainted as accelerated/system leave the pod Pending with
+      # FailedScheduling, the Flux HelmRelease never becomes Ready,
+      # and every downstream release stays blocked on
+      # DependencyNotReady. See PR #1030.
+      tolerations:
+        - operator: Exists
       containers:
         - name: rollout
           image: docker.io/alpine/k8s:1.34.8@sha256:4d352ba7479706876a62566c4a8eaaf44d8182d39ee456dbd884830df5e493be
