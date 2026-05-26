@@ -75,7 +75,6 @@
 {{- $saName := "aicr-dra-rollout-hook" }}
 {{- $parentVersion := index .Values "gpu-operator" "_aicrParentChartVersion" | toString }}
 {{- $versionLabel := $parentVersion | replace "+" "-" | trunc 63 | trimSuffix "-" }}
-{{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 50 | trimSuffix "-" }}
 # $hookRev: pod-spec revision counter. Job .spec.template is immutable
 # (Kubernetes rejects updates to any field under it with
 # "Forbidden: field is immutable"), so changing the image digest,
@@ -89,6 +88,14 @@
 # label app.kubernetes.io/component=dra-rollout-hook if the
 # namespace accumulates noise.
 {{- $hookRev := "1" }}
+# Budget the version-slug truncation so the -r<rev> suffix survives
+# the 63-char DNS-1123 cap on the Job name. Full assembled name shape
+# is: "aicr-dra-rollout-hook-" (22 chars) + <versionSlug> + "-r<rev>".
+# Reserve 6 chars for "-r<rev>" (covers up to -r9999, far more
+# revisions than this hook will ever see) and give the slug the
+# remaining 35 chars (63 - 22 - 6). The outer `trunc 63` on the
+# assembled name stays as a defense-in-depth cap.
+{{- $versionSlug := $parentVersion | replace "." "-" | replace "+" "-" | trunc 35 | trimSuffix "-" }}
 {{- $jobName := printf "aicr-dra-rollout-hook-%s-r%s" $versionSlug $hookRev | trunc 63 | trimSuffix "-" }}
 {{- $chartLabel := printf "%s-%s" .Chart.Name $parentVersion | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 ---
